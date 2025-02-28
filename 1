@@ -1,0 +1,140 @@
+import pandas as pd
+import requests  # Used for making API calls to Groq (and Google API)
+import numpy as np
+import faiss
+from sklearn.cluster import KMeans
+from langchain.embeddings.base import Embeddings
+from langchain.vectorstores import FAISS
+from langchain.llms.base import LLM
+from langchain.chains import RetrievalQA
+
+# -----------------------------------------------------------------------------
+# Step 1: Custom Embeddings Class Using Google’s text-embeddings-004 API
+# -----------------------------------------------------------------------------
+class GoogleAPIEmbeddings(Embeddings):
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        # Hypothetical endpoint for the text-embeddings-004 model.
+        self.endpoint = f"https://generative.googleapis.com/v1/models/text-embeddings-004:predict?key={self.api_key}"
+
+    def _get_embeddings(self, texts: list[str]) -> list[list[float]]:
+        payload = {"instances": [{"content": text} for text in texts]}
+        response = requests.post(self.endpoint, json=payload)
+        if response.status_code == 200:
+            predictions = response.json().get("predictions", [])
+            embeddings = [pred["embeddings"] for pred in predictions]
+            return embeddings
+        else:
+            raise Exception(
+                f"Google API request failed with status code {response.status_code}: {response.text}"
+            )
+    
+    def embed_query(self, text: str) -> list[float]:
+        return self._get_embeddings([text])[0]
+    
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._get_embeddings(texts)
+
+# -----------------------------------------------------------------------------
+# Step 2: Custom Groq LLM (for generating responses)
+# -----------------------------------------------------------------------------
+# Note: There is no official Groq Python package to import.
+# We use the `requests` library to call the Groq API directly.
+class GroqLLM(LLM):
+    def __init__(self, api_key: str, temperature: float = 0.0):
+        self.api_key = api_key
+        self.temperature = temperature
+
+    @property
+    def _llm_type(self) -> str:
+        return "groq"
+    
+    def _call(self, prompt: str, stop=None) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {"prompt": prompt, "temperature": self.temperature}
+        # Hypothetical Groq API endpoint; adjust URL and parameters as needed.
+        response = requests.post("https://api.groq.ai/v1/generate", headers=headers, json=data)
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("text", "")
+        else:
+            raise Exception(
+                f"Groq API request failed with status code {response.status_code}: {response.text}"
+            )
+
+# -----------------------------------------------------------------------------
+# Configuration & API Keys
+# -----------------------------------------------------------------------------
+GOOGLE_API_KEY = "YOUR_GOOGLE_API_KEY"  # Replace with your actual Google API key
+GROQ_API_KEY = "YOUR_GROQ_API_KEY"        # Replace with your actual Groq API key
+
+# -----------------------------------------------------------------------------
+# Step 3: Load CSV and Convert Each Row into a Text Representation
+# -----------------------------------------------------------------------------
+csv_file = "data.csv"  # Path to your CSV file
+df = pd.read_csv(csv_file)
+
+rows_text = []
+rows_metadata = []
+for _, row in df.iterrows():
+    # Concatenate each column and its value for the row.
+    row_text = " | ".join([f"{col}: {row[col]}" for col in df.columns])
+    rows_text.append(row_text)
+    rows_metadata.append(row.to_dict())
+
+# -----------------------------------------------------------------------------
+# Step 4: Compute Embeddings for Each Row
+# -----------------------------------------------------------------------------
+embedding_model = GoogleAPIEmbeddings(api_key=GOOGLE_API_KEY)
+# For 13,000 rows this should be acceptable; consider batching if needed.
+row_embeddings = embedding_model.embed_documents(rows_text)
+embeddings_array = np.array(row_embeddings).astype("float32")  # FAISS requires float32
+
+# -----------------------------------------------------------------------------
+# Step 5: Cluster the Row Embeddings Using KMeans
+# -----------------------------------------------------------------------------
+num_clusters = 100  # Adjust based on your dataset's characteristics.
+kmeans = KMeans(n_clusters=num_clusters, random_state=42)
+clusters = kmeans.fit_predict(embeddings_array)
+
+# Map each cluster label to its corresponding row indices.
+cluster_to_indices = {i: [] for i in range(num_clusters)}
+for idx, cluster_label in enumerate(clusters):
+    cluster_to_indices[cluster_label].append(idx)
+
+# -----------------------------------------------------------------------------
+# Step 6: Aggregate Rows in Each Cluster into a Single "Cluster Document"
+# -----------------------------------------------------------------------------
+cluster_docs = []
+cluster_metadata = []
+for cluster_idx in range(num_clusters):
+    indices = cluster_to_indices[cluster_idx]
+    aggregated_text = "\n".join([rows_text[i] for i in indices])
+    cluster_docs.append(aggregated_text)
+    cluster_metadata.append({
+        "cluster_index": cluster_idx,
+        "num_rows": len(indices),
+        "row_indices": indices
+    })
+
+# -----------------------------------------------------------------------------
+# Step 7: Build a FAISS Vector Store over Cluster Documents
+# -----------------------------------------------------------------------------
+# This step re-embeds the aggregated cluster documents.
+cluster_vectorstore = FAISS.from_texts(cluster_docs, embedding_model, metadatas=cluster_metadata)
+
+# -----------------------------------------------------------------------------
+# Step 8: Set Up a Retrieval-Augmented Generation (RAG) Chain Using LangChain
+# -----------------------------------------------------------------------------
+groq_llm = GroqLLM(api_key=GROQ_API_KEY, temperature=0.0)
+qa_chain = RetrievalQA(llm=groq_llm, retriever=cluster_vectorstore.as_retriever())
+
+# -----------------------------------------------------------------------------
+# Step 9: Query the System
+# -----------------------------------------------------------------------------
+query = "Your query text here"
+result = qa_chain.run(query)
+print("Answer:", result)
